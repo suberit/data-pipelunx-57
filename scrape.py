@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
-"""GitHub Actions Playwright 生产级抓取脚本 V11
+"""GitHub Actions Playwright 生产级抓取脚本 V12（方案 H）
 
 在 GA runner 内运行，用 Playwright 抓取 CSQAQ 网页数据。
 输出 result.json（list 格式，兼容旧方法）。
+
+V12 优化（方案 H：日线 E 策略 + 1h G 策略翻页）：
+- 日线翻页次数 5→10（E 策略：300ms wheel + networkidle + API 计数 + 2000ms）
+- 新增 1h 翻页（G 策略：500ms wheel + networkidle + API 计数 + 2000ms，默认 5 次）
+- 周线采集：CSQAQ 不支持，已跳过
+- 测试验证：daily/item 1285, 1h/item 3459, chip率 98.4%
 
 V11 优化（基于 scrape_test_v4.py 验证）：
 - 移除 signal.alarm（破坏 Playwright 事件循环），改用 page.wait_for_timeout
@@ -26,8 +32,9 @@ from playwright.sync_api import sync_playwright
 DETAIL_URL = "https://csqaq.com/goods/{goods_id}"
 RESULT_FILE = "result.json"
 
-CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "5"))
+CHART_SCROLL_TIMES = int(os.environ.get("CHART_SCROLL_TIMES", "10"))
 SINGLE_ITEM_TIMEOUT = int(os.environ.get("SINGLE_ITEM_TIMEOUT", "120"))
+SCROLL_1H_TIMES = int(os.environ.get("SCROLL_1H_TIMES", "5"))
 
 # API URL 模式（用于智能等待关键 API 返回）
 API_CHART_ALL = "info/simple/chartAll"
@@ -216,11 +223,10 @@ def scrape_one(page, goods_id, item_name=None):
                     page.mouse.wheel(-1500, 0)
                     page.wait_for_timeout(300)
 
-                # 等待网络空闲 + chartAll API 新响应（双重保障）
+                # 等待网络空闲 + chartAll API 新响应 + 2000ms 稳定等待（E 策略）
                 wait_network_idle(page, timeout=8000)
-                if not wait_for_new_response(page, all_api_data, API_CHART_ALL, before_resp_count, timeout=8):
-                    # API 没有新响应，短等待
-                    page.wait_for_timeout(1000)
+                wait_for_new_response(page, all_api_data, API_CHART_ALL, before_resp_count, timeout=8)
+                page.wait_for_timeout(2000)
 
                 current_resp_count = len(all_api_data.get(chart_url, []))
                 if current_resp_count > before_resp_count:
@@ -382,6 +388,70 @@ def scrape_one(page, goods_id, item_name=None):
                     except Exception as e:
                         print(f"      V9 解析失败: {e}", flush=True)
 
+        # 7.5. 1h 翻页（G 策略：500ms wheel + networkidle + API计数 + 2000ms）
+        print(f"  [7.5] 1h 翻页（{SCROLL_1H_TIMES} 次，G 策略 500ms）...", flush=True)
+        # 重新获取 canvas（V9 补救可能重新加载了页面）
+        canvas_info = page.evaluate("""() => {
+            const canvas = document.querySelector('canvas');
+            if (!canvas) return null;
+            const rect = canvas.getBoundingClientRect();
+            return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+        }""")
+
+        if canvas_info:
+            center_y = canvas_info["y"] + canvas_info["height"] / 2
+            no_new_count = 0
+
+            for i in range(SCROLL_1H_TIMES):
+                before_total = len(all_chart_1h)
+                before_resp_count = len(all_api_data.get(chart_url, []))
+
+                # G 策略：500ms × 5 wheel
+                page.mouse.move(canvas_info["x"] + canvas_info["width"] / 2, center_y)
+                for _ in range(5):
+                    page.mouse.wheel(-1500, 0)
+                    page.wait_for_timeout(500)
+
+                wait_network_idle(page, timeout=8000)
+                wait_for_new_response(page, all_api_data, API_CHART_ALL, before_resp_count, timeout=8)
+                page.wait_for_timeout(2000)
+
+                # 解析新响应
+                current_resp_count = len(all_api_data.get(chart_url, []))
+                if current_resp_count > before_resp_count:
+                    for idx in range(before_resp_count, current_resp_count):
+                        try:
+                            parsed = json.loads(all_api_data[chart_url][idx]["body"])
+                            if parsed.get("code") == 200:
+                                arr = parsed.get("data", [])
+                                if isinstance(arr, list) and len(arr) > 0:
+                                    all_chart_1h.extend(arr)
+                                    print(f"      1h 翻页 {i+1}: +{len(arr)} 条, 总计 {len(all_chart_1h)} 条", flush=True)
+                        except Exception:
+                            pass
+
+                if len(all_chart_1h) == before_total:
+                    no_new_count += 1
+                    if no_new_count >= 3:
+                        print(f"      连续 3 次无新数据，停止 1h 翻页", flush=True)
+                        break
+                else:
+                    no_new_count = 0
+
+            # 去重 1h
+            seen_t = set()
+            unique_1h = []
+            for item in all_chart_1h:
+                t = item.get("t")
+                if t and t not in seen_t:
+                    seen_t.add(t)
+                    unique_1h.append(item)
+            all_chart_1h = unique_1h
+            all_chart_1h.sort(key=lambda x: int(x.get("t", 0)))
+            print(f"      ✓ 1h 总计: {len(all_chart_1h)} 条", flush=True)
+        else:
+            print(f"      [警告] 未找到 canvas，跳过 1h 翻页", flush=True)
+
         item_result["chart_1h"] = all_chart_1h
 
         # 8. 筹码分布（V5：优先点击 BUTTON + 不二次点击 + 40 秒超时）
@@ -504,7 +574,7 @@ def main():
     args = parser.parse_args()
 
     print("=" * 60, flush=True)
-    print("  CSQAQ Playwright 抓取 V11（networkidle + V10+V9 补救）", flush=True)
+    print("  CSQAQ Playwright 抓取 V12（H 方案：日线E策略10次 + 1h G策略5次翻页）", flush=True)
     print("=" * 60, flush=True)
 
     # 解析 items
@@ -522,6 +592,8 @@ def main():
         return
 
     print(f"  饰品数量: {len(items)}", flush=True)
+    print(f"  日线翻页: {CHART_SCROLL_TIMES} 次 (E 策略 300ms)", flush=True)
+    print(f"  1h 翻页: {SCROLL_1H_TIMES} 次 (G 策略 500ms)", flush=True)
 
     results = []
     start_time = datetime.datetime.now()
